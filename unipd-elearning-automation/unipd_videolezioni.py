@@ -62,7 +62,7 @@ TODO_TEXT = re.compile(r"da fare|to do|non completat|not completed|segna come fa
 DONE_TEXT = re.compile(r"\bfatto\b|\bdone\b|completato|completed", re.I)
 
 NAV_TIMEOUT_MS = 30_000
-SSO_WAIT_S = 180          # tempo concesso per completare login/MFA a mano
+SSO_WAIT_S = 300          # tempo concesso per completare login/MFA a mano
 VIDEO_START_TIMEOUT_S = 60
 VIDEO_EXTRA_MARGIN_S = 120  # margine oltre la durata del video (buffering, pause)
 
@@ -147,15 +147,20 @@ def login(page: Page, username: str, password: str) -> None:
     login_link.click()
     page.wait_for_load_state("domcontentloaded")
 
-    # Moodle UniPD può mostrare una scelta del metodo di accesso (SSO / account locale)
+    # La pagina di login di Moodle UniPD mostra i pulsanti del Single Sign-On
     sso_button = first_visible(page, [
+        "a.login-identityprovider-btn", ".potentialidplist a", "a[href*='auth/shibboleth']",
+        "a[href*='auth/saml']", "a[href*='auth/oauth2']",
         "a:has-text('Single Sign On')", "a:has-text('SSO')", "a:has-text('Shibboleth')",
-        "a:has-text('Università di Padova')", "a[href*='auth/shibboleth']",
+        "a:has-text('Università di Padova')",
     ], timeout_ms=5_000)
     if sso_button is not None:
-        log.info("Selezione accesso SSO UniPD...")
+        log.info("Selezione accesso SSO UniPD: %s", sso_button.inner_text().strip()[:60])
         sso_button.click()
-        page.wait_for_load_state("domcontentloaded")
+        try:
+            page.wait_for_url(lambda url: "/login/index.php" not in url, timeout=15_000)
+        except PlaywrightTimeoutError:
+            log.warning("Il clic sul pulsante SSO non ha cambiato pagina.")
 
     log.info("Inserimento credenziali...")
     user_field = first_visible(page, [
@@ -165,33 +170,39 @@ def login(page: Page, username: str, password: str) -> None:
     pass_field = first_visible(page, [
         "input[name='j_password']", "input[name='password']", "input[type='password']",
     ], timeout_ms=5_000)
+
     if user_field is None or pass_field is None:
+        # Pagina di login diversa dal previsto: si completa l'accesso a mano nel browser
         screenshot(page, "login_campi_non_trovati")
-        raise RuntimeError(f"Campi username/password non trovati su {page.url}")
-
-    user_field.fill(username)
-    # Il SSO UniPD a volte chiede il dominio (studenti.unipd.it / unipd.it) in una select
-    domain_select = page.locator("select[name*='dominio' i], select[id*='domain' i], select[name*='domain' i]").first
-    if domain_select.count() and "@" not in username:
-        options = domain_select.locator("option").all_inner_texts()
-        studenti = next((o.strip() for o in options if "studenti" in o.lower()), None)
-        if studenti:
-            domain_select.select_option(label=studenti)
-    pass_field.fill(password)
-
-    submit = first_visible(page, [
-        "button[type='submit']", "input[type='submit']", "button:has-text('Accedi')", "button:has-text('Login')",
-    ])
-    if submit is not None:
-        submit.click()
+        log.warning(">>> Non riesco a compilare il login da solo su %s", page.url)
+        log.warning(">>> FAI IL LOGIN A MANO nella finestra di Chrome: lo script riparte da solo dopo.")
     else:
-        pass_field.press("Enter")
+        user_field.fill(username)
+        # Il SSO UniPD a volte chiede il dominio (studenti.unipd.it / unipd.it) in una select
+        domain_select = page.locator("select[name*='dominio' i], select[id*='domain' i], select[name*='domain' i]").first
+        if domain_select.count() and "@" not in username:
+            options = domain_select.locator("option").all_inner_texts()
+            studenti = next((o.strip() for o in options if "studenti" in o.lower()), None)
+            if studenti:
+                domain_select.select_option(label=studenti)
+        pass_field.fill(password)
 
-    # Attesa del rientro su Moodle. Se c'è l'autenticazione a due fattori o un consenso
-    # attributi, l'utente può completarli a mano nella finestra del browser.
-    log.info("Attendo il rientro su Moodle (completa eventuale MFA/consenso nel browser, max %ds)...", SSO_WAIT_S)
+        submit = first_visible(page, [
+            "button[type='submit']", "input[type='submit']", "button:has-text('Accedi')", "button:has-text('Login')",
+        ])
+        if submit is not None:
+            submit.click()
+        else:
+            pass_field.press("Enter")
+
+    # Attesa del rientro su Moodle (fuori dalla pagina di login). Se c'è l'autenticazione
+    # a due fattori o un consenso attributi, l'utente può completarli nel browser.
+    log.info("Attendo il rientro su Moodle (completa eventuale MFA/login nel browser, max %ds)...", SSO_WAIT_S)
     try:
-        page.wait_for_url(re.compile(r"^https://medicina\.elearning\.unipd\.it/"), timeout=SSO_WAIT_S * 1000)
+        page.wait_for_url(
+            lambda url: url.startswith("https://medicina.elearning.unipd.it/") and "/login/" not in url,
+            timeout=SSO_WAIT_S * 1000,
+        )
         page.wait_for_load_state("domcontentloaded")
     except PlaywrightTimeoutError:
         screenshot(page, "login_timeout")

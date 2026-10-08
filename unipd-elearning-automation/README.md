@@ -54,6 +54,7 @@ python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/c
 | `--skip-tests` | solo videolezioni, non si ferma ai test |
 | `--limit N` | esegue al massimo N attività |
 | `--include-unknown` | include anche i video senza tracciamento del completamento |
+| `--mute` | video senza audio, utile se nel frattempo segui altro |
 | `--headless` | browser invisibile (sconsigliato: MFA e play manuale non sono possibili) |
 | `--fresh-login` | ignora la sessione salvata |
 | `-v` | log dettagliato (stato di ogni attività) |

@@ -554,7 +554,7 @@ def run(args: argparse.Namespace) -> int:
         browser = pw.chromium.launch(
             headless=args.headless,
             slow_mo=100,
-            args=["--autoplay-policy=no-user-gesture-required"],
+            args=["--autoplay-policy=no-user-gesture-required"] + (["--mute-audio"] if args.mute else []),
         )
         context = new_context(browser, use_saved_state=not args.fresh_login)
         page = context.new_page()
@@ -643,6 +643,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="numero massimo di attività da eseguire")
     p.add_argument("--include-unknown", action="store_true",
                    help="includi anche i video senza tracciamento del completamento")
+    p.add_argument("--mute", action="store_true", help="video senza audio (utile se nel frattempo segui altro)")
     p.add_argument("--headless", action="store_true", help="browser invisibile (sconsigliato: MFA e play manuale)")
     p.add_argument("--fresh-login", action="store_true", help="ignora la sessione salvata in auth_state.json")
     p.add_argument("-v", "--verbose", action="store_true")

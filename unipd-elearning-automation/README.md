@@ -5,10 +5,13 @@ Script Python + Playwright che, su https://medicina.elearning.unipd.it/:
 1. apre la home page di Moodle;
 2. clicca **Login/Accedi** e passa al Single Sign-On UniPD;
 3. inserisce le credenziali (con attesa per eventuale MFA da completare a mano);
-4. naviga *Laurea Magistrale a ciclo unico → Farmacia (ME2946) → Precorso di calcolo*
-   (se la navigazione per categorie fallisce usa la ricerca corsi di Moodle);
-5. individua le videolezioni **non ancora completate** (indicatori di completamento Moodle 3.x/4.x)
-   e le riproduce una alla volta fino alla fine, tornando poi alla pagina del corso.
+4. apre *I miei corsi → Precorso di calcolo* (in alternativa le categorie o la ricerca corsi);
+5. percorre le unità in ordine fino alla fine:
+   - **videolezioni non completate**: le riproduce fino alla fine e, se il corso usa il
+     completamento manuale, preme "Segna come fatto";
+   - **test**: li apre e aspetta che tu li svolga, poi premi Invio nel Terminale e prosegue;
+   - dopo ogni attività ricarica il corso, così compaiono le unità sbloccate dal test, e
+     controlla che Moodle segni l'attività come completata.
 
 ## Installazione
 
@@ -48,7 +51,8 @@ python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/c
 |---|---|
 | `--course-url` | apre direttamente il corso (consigliato dopo il primo lancio: è il più robusto) |
 | `--dry-run` | mostra l'elenco senza riprodurre |
-| `--limit N` | riproduce al massimo N videolezioni |
+| `--skip-tests` | solo videolezioni, non si ferma ai test |
+| `--limit N` | esegue al massimo N attività |
 | `--include-unknown` | include anche i video senza tracciamento del completamento |
 | `--headless` | browser invisibile (sconsigliato: MFA e play manuale non sono possibili) |
 | `--fresh-login` | ignora la sessione salvata |
@@ -67,8 +71,9 @@ python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/c
 
 ## Note
 
-- Il video viene riprodotto a velocità normale nel browser visibile: lo script ti risparmia i
-  clic, ma la lezione la segui tu. Lascia la finestra aperta finché non finisce.
+- Il video viene riprodotto a velocità normale nel browser visibile, così Moodle registra la
+  visione reale. Lascia la finestra aperta finché non finisce. I test non vengono compilati
+  dallo script.
 - Lo script non è stato provato sul sito reale (non raggiungibile dall'ambiente di sviluppo):
   se un passaggio fallisce, guarda lo screenshot in `screenshots/` e adatta il selettore
   corrispondente all'inizio di `unipd_videolezioni.py` (`CATEGORY_PATH`, `VIDEO_MODTYPES`, ...).

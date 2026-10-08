@@ -5,13 +5,17 @@ Flusso:
   1. apre https://medicina.elearning.unipd.it/
   2. clicca "Login" / "Accedi" e passa al Single Sign-On UniPD
   3. inserisce le credenziali (lette da variabili d'ambiente o chieste a terminale)
-  4. naviga: Laurea Magistrale a ciclo unico -> Farmacia (ME2946) -> Precorso di calcolo
-  5. apre una alla volta le videolezioni non ancora completate e le riproduce
-     fino alla fine (velocità 1x, browser visibile), poi torna al corso.
+  4. naviga: I miei corsi -> Precorso di calcolo
+     (in alternativa: categorie Laurea Magistrale a ciclo unico -> Farmacia -> corso, o ricerca)
+  5. percorre le unità in ordine, fino alla fine:
+     - videolezione non completata: la riproduce fino alla fine (velocità 1x, browser visibile);
+     - test non completato: lo apre e aspetta che tu lo svolga, poi prosegue.
+     Dopo ogni attività ricarica il corso, così compaiono le unità sbloccate dal test.
 
 Uso:
   python unipd_videolezioni.py               # browser visibile (consigliato)
-  python unipd_videolezioni.py --dry-run     # elenca soltanto le videolezioni da vedere
+  python unipd_videolezioni.py --dry-run     # elenca soltanto le attività da fare
+  python unipd_videolezioni.py --skip-tests  # solo video, salta i test
   python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/course/view.php?id=XXXX"
 """
 
@@ -52,10 +56,12 @@ CATEGORY_PATH = [
     r"precorso\s+di\s+calcolo|me\s*2946",
 ]
 COURSE_SEARCH_TERM = "Precorso di calcolo"
+COURSE_NAME = re.compile(r"precorso.*calcolo", re.I)
 
 # Tipi di attività Moodle che di solito contengono video (classe CSS "modtype_<nome>")
 VIDEO_MODTYPES = {"kalvidres", "kalvidpres", "videotime", "hvp", "h5pactivity", "url", "page", "resource", "lti"}
 VIDEO_NAME_HINT = re.compile(r"video|lezione|lesson|registrazion|parte\s*\d", re.I)
+TEST_MODTYPES = {"quiz"}
 
 # Testi che Moodle (IT/EN) usa per lo stato di completamento
 TODO_TEXT = re.compile(r"da fare|to do|non completat|not completed|segna come fatto|mark as done", re.I)
@@ -74,6 +80,7 @@ class Activity:
     name: str
     url: str
     modtype: str
+    kind: str  # "video" oppure "test"
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +265,22 @@ def open_course(page: Page, course_url: str | None) -> None:
         goto(page, course_url)
         return
 
+    log.info("Apro 'I miei corsi'...")
+    for my_page in ("my/courses.php", "my/"):
+        goto(page, BASE_URL + my_page)
+        # Le schede dei corsi vengono caricate in modo asincrono dopo la pagina
+        card = page.locator("a[href*='course/view.php']").filter(has_text=COURSE_NAME).first
+        try:
+            card.wait_for(state="visible", timeout=15_000)
+        except PlaywrightTimeoutError:
+            continue
+        log.info("  clic su: %s", re.sub(r"\s+", " ", card.inner_text()).strip())
+        card.click()
+        page.wait_for_url(re.compile(r"course/view\.php"), timeout=NAV_TIMEOUT_MS)
+        page.wait_for_load_state("domcontentloaded")
+        return
+    log.warning("Corso non trovato in 'I miei corsi', provo dalle categorie.")
+
     log.info("Navigazione tra le categorie: %s", " -> ".join(CATEGORY_PATH))
     try:
         goto(page, BASE_URL + "course/index.php")
@@ -274,9 +297,7 @@ def open_course(page: Page, course_url: str | None) -> None:
 
     # Fallback: ricerca corsi di Moodle
     goto(page, f"{BASE_URL}course/search.php?search={COURSE_SEARCH_TERM.replace(' ', '+')}")
-    result = page.locator(".coursename a, h3.coursename a, a.aalink.coursename").filter(
-        has_text=re.compile(r"precorso.*calcolo", re.I)
-    ).first
+    result = page.locator(".coursename a, h3.coursename a, a.aalink.coursename").filter(has_text=COURSE_NAME).first
     try:
         result.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeoutError:
@@ -310,34 +331,84 @@ def completion_state(activity: Locator) -> str:
     return "unknown"
 
 
-def find_unwatched_videos(page: Page, include_unknown: bool) -> list[Activity]:
-    page.locator("li.activity").first.wait_for(state="attached", timeout=NAV_TIMEOUT_MS)
-    # Espande eventuali sezioni compresse (formato "collapsed topics" / Moodle 4)
+def expand_sections(page: Page) -> None:
+    """Espande eventuali sezioni compresse (formato "collapsed topics" / Moodle 4)."""
     for toggle in page.locator("a[data-toggle='collapse'][aria-expanded='false'], .collapsed[data-for='sectiontoggler']").all():
         try:
             toggle.click(timeout=2_000)
         except PlaywrightError:
             pass
 
-    activities: list[Activity] = []
+
+def activities_on_page(page: Page) -> list[tuple[Activity, str]]:
+    """Videolezioni e test della pagina corrente, nell'ordine del corso, con lo stato di completamento."""
+    try:
+        page.locator("li.activity").first.wait_for(state="attached", timeout=10_000)
+    except PlaywrightTimeoutError:
+        return []
+    expand_sections(page)
+    found: list[tuple[Activity, str]] = []
     for item in page.locator("li.activity").all():
         classes = item.get_attribute("class") or ""
         modtype = next((c.removeprefix("modtype_") for c in classes.split() if c.startswith("modtype_")), "")
+        # Le attività non ancora sbloccate (restrizioni) non hanno il link: vengono saltate
         link = item.locator("a.aalink, .activityname a, .activityinstance a").first
         if not link.count():
             continue
         name = re.sub(r"\s+", " ", link.inner_text()).strip()
-        url = link.get_attribute("href") or ""
-        is_video = modtype in {"kalvidres", "kalvidpres", "videotime", "hvp", "h5pactivity"} or (
+        url = link.evaluate("el => el.href || ''")
+        if modtype in TEST_MODTYPES:
+            kind = "test"
+        elif modtype in {"kalvidres", "kalvidpres", "videotime", "hvp", "h5pactivity"} or (
             modtype in VIDEO_MODTYPES and VIDEO_NAME_HINT.search(name)
-        )
-        if not is_video or not url:
+        ):
+            kind = "video"
+        else:
+            continue
+        if not url:
             continue
         state = completion_state(item)
         log.debug("Attività '%s' [%s] stato=%s", name, modtype, state)
+        found.append((Activity(name=name, url=url, modtype=modtype, kind=kind), state))
+    return found
+
+
+def find_pending_activities(page: Page, course_url: str, include_unknown: bool) -> list[Activity]:
+    """Tutte le attività da fare del corso, unità per unità (anche se ogni unità ha una pagina propria)."""
+    goto(page, course_url)
+    section_urls: list[str] = []
+    for a in page.locator("a[href*='course/section.php'], .sectionname a[href*='section='], "
+                          ".section-title a[href*='section=']").all():
+        href = a.evaluate("el => el.href")  # URL assoluto
+        if href and href not in section_urls:
+            section_urls.append(href)
+
+    found = activities_on_page(page)
+    for url in section_urls:
+        goto(page, url)
+        found += activities_on_page(page)
+
+    pending: list[Activity] = []
+    seen: set[str] = set()
+    for act, state in found:
+        if act.url in seen:
+            continue
+        seen.add(act.url)
         if state == "todo" or (state == "unknown" and include_unknown):
-            activities.append(Activity(name=name, url=url, modtype=modtype))
-    return activities
+            pending.append(act)
+    return pending
+
+
+def do_test(page: Page, activity: Activity) -> None:
+    """I test li svolgi tu: lo script apre la pagina e aspetta che tu abbia finito."""
+    log.info("📝 TEST: %s", activity.name)
+    goto(page, activity.url)
+    print("\n" + "=" * 70)
+    print(f"  È il momento del test: '{activity.name}'")
+    print("  Svolgilo nella finestra di Chrome (consegna compresa).")
+    print("  Quando hai finito, torna qui e premi INVIO per continuare.")
+    print("=" * 70)
+    input()
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +443,18 @@ def start_playback(frame: Frame) -> None:
         const v = document.querySelector('video');
         if (v && v.paused) { v.play().catch(() => {}); }
     }""")
+
+
+def mark_done_if_manual(page: Page) -> None:
+    """Se l'attività ha il completamento manuale, preme "Segna come fatto" a video finito."""
+    button = page.locator("button[data-toggletype='manual:mark-done']").first
+    try:
+        if button.count() and button.is_visible():
+            button.click()
+            page.locator("button[data-toggletype='manual:undo']").first.wait_for(timeout=10_000)
+            log.info("  ✔ segnato come fatto")
+    except PlaywrightError as exc:
+        log.warning("  impossibile premere 'Segna come fatto': %s", exc)
 
 
 def watch_video(page: Page, activity: Activity) -> bool:
@@ -422,7 +505,8 @@ def watch_video(page: Page, activity: Activity) -> bool:
         if state is None:
             break
         if state["ended"] or (state["d"] and state["t"] >= state["d"] - 1):
-            log.info("  ✔ completato: %s", activity.name)
+            log.info("  ✔ video finito: %s", activity.name)
+            mark_done_if_manual(page)
             return True
         if state["paused"]:
             start_playback(frame)  # riprende se il player si è fermato da solo
@@ -477,26 +561,45 @@ def run(args: argparse.Namespace) -> int:
             course_url = page.url
             log.info("Pagina del corso: %s", course_url)
 
-            pending = find_unwatched_videos(page, include_unknown=args.include_unknown)
-            log.info("Videolezioni non ancora viste: %d", len(pending))
+            pending = find_pending_activities(page, course_url, args.include_unknown)
+            log.info("Attività da fare: %d", len(pending))
             for i, act in enumerate(pending, 1):
-                log.info("  %d. %s [%s]", i, act.name, act.modtype)
-            if args.dry_run or not pending:
+                log.info("  %d. [%s] %s", i, act.kind.upper(), act.name)
+            if args.dry_run:
                 return 0
 
-            failures = 0
-            for act in pending[: args.limit or None]:
+            # Una attività alla volta, ricaricando il corso dopo ognuna: completare un test
+            # può sbloccare l'unità successiva, che prima non era visibile.
+            handled: set[str] = set()
+            completed = failures = 0
+            while True:
+                todo = [a for a in pending if a.url not in handled]
+                if args.skip_tests:
+                    todo = [a for a in todo if a.kind != "test"]
+                if not todo or (args.limit and completed + failures >= args.limit):
+                    break
+                act = todo[0]
+                handled.add(act.url)
                 try:
-                    if not watch_video(page, act):
+                    if act.kind == "test":
+                        do_test(page, act)
+                        completed += 1
+                    elif watch_video(page, act):
+                        completed += 1
+                    else:
                         failures += 1
                 except (PlaywrightError, RuntimeError) as exc:
                     failures += 1
                     log.error("Errore su '%s': %s", act.name, exc)
                     screenshot(page, f"errore_{act.name}")
-                finally:
-                    # Torno al corso così Moodle aggiorna lo stato di completamento
-                    goto(page, course_url)
-            log.info("Fine. Completate: %d, con problemi: %d", len(pending[: args.limit or None]) - failures, failures)
+                # Ricarico il corso così Moodle aggiorna completamenti e unità sbloccate
+                pending = find_pending_activities(page, course_url, args.include_unknown)
+                if any(a.url == act.url for a in pending):
+                    log.warning("  ⚠ Moodle non segna ancora '%s' come completata.", act.name)
+                else:
+                    log.info("  ✔ risulta completata su Moodle: %s", act.name)
+
+            log.info("Fine. Completate: %d, con problemi: %d", completed, failures)
             exit_code = 1 if failures else 0
         except (PlaywrightError, RuntimeError) as exc:
             log.error("Esecuzione interrotta: %s", exc)
@@ -512,10 +615,11 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Videolezioni non viste - Precorso di calcolo (Farmacia ME2946)")
+    p = argparse.ArgumentParser(description="Precorso di calcolo (Farmacia ME2946): videolezioni e test non completati")
     p.add_argument("--course-url", help="URL diretto del corso (salta la navigazione tra le categorie)")
-    p.add_argument("--dry-run", action="store_true", help="elenca le videolezioni da vedere senza riprodurle")
-    p.add_argument("--limit", type=int, default=0, help="numero massimo di videolezioni da riprodurre")
+    p.add_argument("--dry-run", action="store_true", help="elenca le attività da fare senza eseguirle")
+    p.add_argument("--skip-tests", action="store_true", help="riproduce solo i video, senza fermarsi ai test")
+    p.add_argument("--limit", type=int, default=0, help="numero massimo di attività da eseguire")
     p.add_argument("--include-unknown", action="store_true",
                    help="includi anche i video senza tracciamento del completamento")
     p.add_argument("--headless", action="store_true", help="browser invisibile (sconsigliato: MFA e play manuale)")

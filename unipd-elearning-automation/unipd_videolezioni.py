@@ -128,6 +128,62 @@ def is_logged_in(page: Page) -> bool:
     return page.locator("#user-menu-toggle, .usermenu .userbutton, a[href*='logout.php']").count() > 0
 
 
+def fill_credentials(page: Page, username: str, password: str) -> bool:
+    """Compila il form dell'SSO UniPD. Ritorna False se il form non è quello atteso."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=10_000)
+    except PlaywrightTimeoutError:
+        pass
+    time.sleep(1)  # il form UniPD viene riscritto via JavaScript dopo il caricamento
+
+    # SSO UniPD: campo visibile "j_username_js" con il solo nome utente + menu col dominio;
+    # il campo "j_username" vero è nascosto e viene riempito dalla pagina stessa.
+    js_field = page.locator("#j_username_js").first
+    if js_field.count() and js_field.is_visible():
+        local, _, domain = username.partition("@")
+        js_field.fill(local, timeout=5_000)
+        if domain:
+            for select in page.locator("select").all():
+                if not select.is_visible():
+                    continue
+                for opt in select.locator("option").all():
+                    text = (opt.inner_text() + " " + (opt.get_attribute("value") or "")).lower()
+                    if domain.lower() in text:
+                        select.select_option(value=opt.get_attribute("value") or opt.inner_text())
+                        break
+    else:
+        user_field = first_visible(page, [
+            "input[name='j_username']", "input[name='username']", "input[type='email']",
+            "input[autocomplete='username']", "input[type='text']",
+        ], timeout_ms=15_000)
+        if user_field is None:
+            return False
+        user_field.fill(username, timeout=5_000)
+
+    submit_selectors = [
+        "button[type='submit']", "input[type='submit']", "button:has-text('Accedi')",
+        "button:has-text('Avanti')", "button:has-text('Login')",
+    ]
+    pass_field = first_visible(page, ["input[type='password']"], timeout_ms=3_000)
+    if pass_field is None:
+        # Login in due passaggi: prima il nome utente, poi la password
+        submit = first_visible(page, submit_selectors)
+        if submit is None:
+            return False
+        submit.click()
+        pass_field = first_visible(page, ["input[type='password']"], timeout_ms=15_000)
+        if pass_field is None:
+            return False
+    pass_field.fill(password, timeout=5_000)
+
+    submit = first_visible(page, submit_selectors)
+    if submit is not None:
+        submit.click()
+    else:
+        pass_field.press("Enter")
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Passi 1-3: apertura sito e login
 # --------------------------------------------------------------------------- #
@@ -163,37 +219,16 @@ def login(page: Page, username: str, password: str) -> None:
             log.warning("Il clic sul pulsante SSO non ha cambiato pagina.")
 
     log.info("Inserimento credenziali...")
-    user_field = first_visible(page, [
-        "input[name='j_username']", "#j_username_js", "input[name='username']",
-        "input[type='email']", "input[autocomplete='username']",
-    ], timeout_ms=15_000)
-    pass_field = first_visible(page, [
-        "input[name='j_password']", "input[name='password']", "input[type='password']",
-    ], timeout_ms=5_000)
-
-    if user_field is None or pass_field is None:
+    try:
+        filled = fill_credentials(page, username, password)
+    except PlaywrightError as exc:
+        log.debug("Compilazione automatica fallita: %s", exc)
+        filled = False
+    if not filled:
         # Pagina di login diversa dal previsto: si completa l'accesso a mano nel browser
         screenshot(page, "login_campi_non_trovati")
         log.warning(">>> Non riesco a compilare il login da solo su %s", page.url)
         log.warning(">>> FAI IL LOGIN A MANO nella finestra di Chrome: lo script riparte da solo dopo.")
-    else:
-        user_field.fill(username)
-        # Il SSO UniPD a volte chiede il dominio (studenti.unipd.it / unipd.it) in una select
-        domain_select = page.locator("select[name*='dominio' i], select[id*='domain' i], select[name*='domain' i]").first
-        if domain_select.count() and "@" not in username:
-            options = domain_select.locator("option").all_inner_texts()
-            studenti = next((o.strip() for o in options if "studenti" in o.lower()), None)
-            if studenti:
-                domain_select.select_option(label=studenti)
-        pass_field.fill(password)
-
-        submit = first_visible(page, [
-            "button[type='submit']", "input[type='submit']", "button:has-text('Accedi')", "button:has-text('Login')",
-        ])
-        if submit is not None:
-            submit.click()
-        else:
-            pass_field.press("Enter")
 
     # Attesa del rientro su Moodle (fuori dalla pagina di login). Se c'è l'autenticazione
     # a due fattori o un consenso attributi, l'utente può completarli nel browser.

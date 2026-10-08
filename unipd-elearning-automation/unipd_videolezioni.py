@@ -609,8 +609,12 @@ def run(args: argparse.Namespace) -> int:
             log.info("Interrotto dall'utente.")
             exit_code = 130
         finally:
-            context.close()
-            browser.close()
+            # Dopo Ctrl+C il driver di Playwright può essere già chiuso: ignoro gli errori
+            for close in (context.close, browser.close):
+                try:
+                    close()
+                except Exception:
+                    pass
         return exit_code
 
 

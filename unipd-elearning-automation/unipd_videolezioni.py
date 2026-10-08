@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,10 +59,13 @@ CATEGORY_PATH = [
 COURSE_SEARCH_TERM = "Precorso di calcolo"
 COURSE_NAME = re.compile(r"precorso.*calcolo", re.I)
 
-# Tipi di attività Moodle che di solito contengono video (classe CSS "modtype_<nome>")
-VIDEO_MODTYPES = {"kalvidres", "kalvidpres", "videotime", "hvp", "h5pactivity", "url", "page", "resource", "lti"}
-VIDEO_NAME_HINT = re.compile(r"video|lezione|lesson|registrazion|parte\s*\d", re.I)
+# Tipi di attività Moodle (classe CSS "modtype_<nome>"). Tutte le altre attività non completate
+# vengono aperte: se contengono un video lo script lo riproduce, altrimenti passa oltre.
 TEST_MODTYPES = {"quiz"}
+NON_VIDEO_MODTYPES = {
+    "forum", "assign", "choice", "feedback", "glossary", "wiki", "chat", "workshop", "folder",
+    "data", "survey", "attendance", "questionnaire", "label", "subsection", "bigbluebuttonbn", "zoom",
+}
 
 # Testi che Moodle (IT/EN) usa per lo stato di completamento
 TODO_TEXT = re.compile(r"da fare|to do|non completat|not completed|segna come fatto|mark as done", re.I)
@@ -70,6 +74,7 @@ DONE_TEXT = re.compile(r"\bfatto\b|\bdone\b|completato|completed", re.I)
 NAV_TIMEOUT_MS = 30_000
 SSO_WAIT_S = 300          # tempo concesso per completare login/MFA a mano
 VIDEO_START_TIMEOUT_S = 60
+VIDEO_SEARCH_TIMEOUT_S = 20  # tempo per trovare un player nella pagina di un'attività
 VIDEO_EXTRA_MARGIN_S = 120  # margine oltre la durata del video (buffering, pause)
 
 log = logging.getLogger("unipd")
@@ -359,12 +364,10 @@ def activities_on_page(page: Page) -> list[tuple[Activity, str]]:
         url = link.evaluate("el => el.href || ''")
         if modtype in TEST_MODTYPES:
             kind = "test"
-        elif modtype in {"kalvidres", "kalvidpres", "videotime", "hvp", "h5pactivity"} or (
-            modtype in VIDEO_MODTYPES and VIDEO_NAME_HINT.search(name)
-        ):
-            kind = "video"
-        else:
+        elif modtype in NON_VIDEO_MODTYPES:
             continue
+        else:
+            kind = "video"  # possibile video: lo si verifica aprendo l'attività
         if not url:
             continue
         state = completion_state(item)
@@ -373,7 +376,7 @@ def activities_on_page(page: Page) -> list[tuple[Activity, str]]:
     return found
 
 
-def find_pending_activities(page: Page, course_url: str, include_unknown: bool) -> list[Activity]:
+def find_pending_activities(page: Page, course_url: str, include_unknown: bool, summary: bool = False) -> list[Activity]:
     """Tutte le attività da fare del corso, unità per unità (anche se ogni unità ha una pagina propria)."""
     goto(page, course_url)
     section_urls: list[str] = []
@@ -387,6 +390,12 @@ def find_pending_activities(page: Page, course_url: str, include_unknown: bool) 
     for url in section_urls:
         goto(page, url)
         found += activities_on_page(page)
+
+    if summary:
+        counts = Counter((act.modtype, state) for act, state in found)
+        log.info("Riepilogo del corso (tipo attività / stato -> quante):")
+        for (modtype, state), n in sorted(counts.items()):
+            log.info("    %-14s %-8s %d", modtype, state, n)
 
     pending: list[Activity] = []
     seen: set[str] = set()
@@ -457,7 +466,8 @@ def mark_done_if_manual(page: Page) -> None:
         log.warning("  impossibile premere 'Segna come fatto': %s", exc)
 
 
-def watch_video(page: Page, activity: Activity) -> bool:
+def watch_video(page: Page, activity: Activity) -> bool | None:
+    """True = video visto fino alla fine, False = problema, None = l'attività non contiene video."""
     log.info("▶ Apro: %s", activity.name)
     goto(page, activity.url)
 
@@ -468,11 +478,10 @@ def watch_video(page: Page, activity: Activity) -> bool:
             inner.click()
             page.wait_for_load_state("domcontentloaded")
 
-    frame = find_video_frame(page, VIDEO_START_TIMEOUT_S)
+    frame = find_video_frame(page, VIDEO_SEARCH_TIMEOUT_S)
     if frame is None:
-        log.warning("Nessun player video trovato in '%s'.", activity.name)
-        screenshot(page, f"no_video_{activity.name}")
-        return False
+        log.info("  nessun video in '%s' [%s], passo oltre.", activity.name, activity.modtype)
+        return None
 
     start_playback(frame)
     try:
@@ -561,10 +570,10 @@ def run(args: argparse.Namespace) -> int:
             course_url = page.url
             log.info("Pagina del corso: %s", course_url)
 
-            pending = find_pending_activities(page, course_url, args.include_unknown)
+            pending = find_pending_activities(page, course_url, args.include_unknown, summary=True)
             log.info("Attività da fare: %d", len(pending))
             for i, act in enumerate(pending, 1):
-                log.info("  %d. [%s] %s", i, act.kind.upper(), act.name)
+                log.info("  %d. [%s] %s (%s)", i, act.kind.upper(), act.name, act.modtype)
             if args.dry_run:
                 return 0
 
@@ -580,20 +589,28 @@ def run(args: argparse.Namespace) -> int:
                     break
                 act = todo[0]
                 handled.add(act.url)
+                played = False
                 try:
                     if act.kind == "test":
                         do_test(page, act)
                         completed += 1
-                    elif watch_video(page, act):
-                        completed += 1
                     else:
-                        failures += 1
+                        result = watch_video(page, act)
+                        if result is None:
+                            continue  # non era un video
+                        played = True
+                        if result:
+                            completed += 1
+                        else:
+                            failures += 1
                 except (PlaywrightError, RuntimeError) as exc:
                     failures += 1
                     log.error("Errore su '%s': %s", act.name, exc)
                     screenshot(page, f"errore_{act.name}")
                 # Ricarico il corso così Moodle aggiorna completamenti e unità sbloccate
                 pending = find_pending_activities(page, course_url, args.include_unknown)
+                if not played and act.kind == "video":
+                    continue
                 if any(a.url == act.url for a in pending):
                     log.warning("  ⚠ Moodle non segna ancora '%s' come completata.", act.name)
                 else:

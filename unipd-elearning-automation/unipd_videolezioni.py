@@ -17,6 +17,11 @@ Uso:
   python unipd_videolezioni.py --dry-run     # elenca soltanto le attività da fare
   python unipd_videolezioni.py --skip-tests  # solo video, salta i test
   python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/course/view.php?id=XXXX"
+
+Funziona anche con altri Moodle UniPD passando l'URL del corso, per esempio:
+  python unipd_videolezioni.py --course-url "https://elearning.unipd.it/formazione/course/view.php?id=383"
+Se il corso chiede di confermare la presenza, lo script si ferma, ti avvisa con suono e
+notifica e aspetta che la conferma la faccia tu nel browser: non la clicca mai da solo.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import getpass
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -47,7 +53,7 @@ from playwright.sync_api import (
 # --------------------------------------------------------------------------- #
 BASE_URL = "https://medicina.elearning.unipd.it/"
 HERE = Path(__file__).resolve().parent
-STATE_FILE = HERE / "auth_state.json"        # sessione salvata (cookie) per evitare login ripetuti
+STATE_FILE = HERE / "auth_state.json"        # sessione salvata (cookie); un file per ogni sito Moodle
 SCREENSHOT_DIR = HERE / "screenshots"         # screenshot salvati in caso di errore
 
 # Percorso nelle categorie di Moodle (regex case-insensitive, nell'ordine in cui si cliccano)
@@ -70,6 +76,16 @@ NON_VIDEO_MODTYPES = {
 # Testi che Moodle (IT/EN) usa per lo stato di completamento
 TODO_TEXT = re.compile(r"da fare|to do|non completat|not completed|segna come fatto|mark as done", re.I)
 DONE_TEXT = re.compile(r"\bfatto\b|\bdone\b|completato|completed", re.I)
+
+# Richiesta di conferma presenza: finestre/overlay con questi testi
+PRESENCE_TEXT = re.compile(
+    r"presenz|sei ancora|ancora (lì|li|qui)|sei qui|ci sei|conferm|still (here|watching)|are you there", re.I
+)
+PRESENCE_OVERLAYS = [
+    "[role='dialog']", "[role='alertdialog']", ".modal.show", ".modal.in", ".ui-dialog",
+    ".swal2-popup", ".vjs-modal-dialog", ".moodle-dialogue", "[class*='popup' i]", "[class*='overlay' i]",
+]
+PRESENCE_BUTTONS = re.compile(r"conferm|sono presente|presente|sono qui|ci sono|still here|i.?m here", re.I)
 
 NAV_TIMEOUT_MS = 30_000
 SSO_WAIT_S = 300          # tempo concesso per completare login/MFA a mano
@@ -247,7 +263,7 @@ def login(page: Page, username: str, password: str) -> None:
     log.info("Attendo il rientro su Moodle (completa eventuale MFA/login nel browser, max %ds)...", SSO_WAIT_S)
     try:
         page.wait_for_url(
-            lambda url: url.startswith("https://medicina.elearning.unipd.it/") and "/login/" not in url,
+            lambda url: url.startswith(BASE_URL) and "/login/" not in url,
             timeout=SSO_WAIT_S * 1000,
         )
         page.wait_for_load_state("domcontentloaded")
@@ -454,6 +470,63 @@ def start_playback(frame: Frame) -> None:
     }""")
 
 
+def notify_user(page: Page, title: str, message: str) -> None:
+    """Avvisa con campanello nel Terminale, notifica e suono del Mac, e porta Chrome in primo piano."""
+    print("\a\n" + "!" * 70 + f"\n  {title}: {message}\n" + "!" * 70, flush=True)
+    if sys.platform == "darwin":
+        script = f'display notification "{message}" with title "{title}" sound name "Glass"'
+        subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"])
+    try:
+        page.bring_to_front()
+    except PlaywrightError:
+        pass
+
+
+def find_presence_prompt(page: Page) -> Locator | None:
+    """Cerca una richiesta di conferma presenza visibile, nella pagina o negli iframe del player."""
+    for frame in page.frames:
+        try:
+            for sel in PRESENCE_OVERLAYS:
+                for loc in frame.locator(sel).filter(has_text=PRESENCE_TEXT).all():
+                    if loc.is_visible():
+                        return loc
+            button = frame.get_by_role("button", name=PRESENCE_BUTTONS).first
+            if button.count() and button.is_visible():
+                return button
+        except PlaywrightError:
+            continue
+    return None
+
+
+def wait_for_user_presence(page: Page) -> float:
+    """Se c'è una richiesta di presenza avvisa e aspetta che la confermi tu. Ritorna i secondi attesi."""
+    prompt = find_presence_prompt(page)
+    if prompt is None:
+        return 0.0
+    started = time.monotonic()
+    log.info("  ✋ richiesta di conferma presenza: aspetto che la confermi tu nel browser...")
+    last_alert = 0.0
+    while find_presence_prompt(page) is not None:
+        if time.monotonic() - last_alert > 60:  # ripete l'avviso ogni minuto
+            notify_user(page, "Conferma la presenza", "Il corso chiede di confermare che stai seguendo")
+            last_alert = time.monotonic()
+        time.sleep(2)
+    log.info("  presenza confermata, proseguo.")
+    return time.monotonic() - started
+
+
+def handle_js_dialog(page: Page, dialog) -> None:
+    """Finestre alert/confirm del browser: le accetta solo dopo che premi Invio nel Terminale."""
+    if dialog.type == "beforeunload":  # "vuoi lasciare la pagina?": non riguarda la presenza
+        dialog.accept()
+        return
+    notify_user(page, "Il corso chiede una conferma", dialog.message[:120].replace('"', "'"))
+    print(f"Messaggio del corso: {dialog.message}")
+    input("Se sei qui e vuoi confermare, premi INVIO nel Terminale... ")
+    dialog.accept()
+
+
 def mark_done_if_manual(page: Page) -> None:
     """Se l'attività ha il completamento manuale, preme "Segna come fatto" a video finito."""
     button = page.locator("button[data-toggletype='manual:mark-done']").first
@@ -483,6 +556,7 @@ def watch_video(page: Page, activity: Activity) -> bool | None:
         log.info("  nessun video in '%s' [%s], passo oltre.", activity.name, activity.modtype)
         return None
 
+    wait_for_user_presence(page)
     start_playback(frame)
     try:
         frame.wait_for_function(
@@ -513,6 +587,8 @@ def watch_video(page: Page, activity: Activity) -> bool | None:
             continue
         if state is None:
             break
+        # Prima la presenza: il video non va mai fatto ripartire sopra una richiesta di conferma
+        deadline += wait_for_user_presence(page)
         if state["ended"] or (state["d"] and state["t"] >= state["d"] - 1):
             log.info("  ✔ video finito: %s", activity.name)
             mark_done_if_manual(page)
@@ -549,7 +625,21 @@ def new_context(browser, use_saved_state: bool) -> BrowserContext:
     return ctx
 
 
+def configure_site(course_url: str | None) -> None:
+    """Ricava il sito Moodle dall'URL del corso (es. .../formazione/course/view.php?id=383)."""
+    global BASE_URL, STATE_FILE
+    if course_url and "/course/" in course_url:
+        BASE_URL = course_url.split("/course/")[0] + "/"
+    slug = re.sub(r"[^a-z0-9]+", "_", BASE_URL.split("://", 1)[-1].lower()).strip("_")
+    STATE_FILE = HERE / f"auth_state_{slug}.json"
+    legacy = HERE / "auth_state.json"  # sessione salvata dalle versioni precedenti (solo medicina)
+    if "medicina" in slug and legacy.exists() and not STATE_FILE.exists():
+        legacy.rename(STATE_FILE)
+    log.info("Sito Moodle: %s", BASE_URL)
+
+
 def run(args: argparse.Namespace) -> int:
+    configure_site(args.course_url)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=args.headless,
@@ -558,6 +648,7 @@ def run(args: argparse.Namespace) -> int:
         )
         context = new_context(browser, use_saved_state=not args.fresh_login)
         page = context.new_page()
+        page.on("dialog", lambda dialog: handle_js_dialog(page, dialog))
         exit_code = 0
         try:
             goto(page, BASE_URL)

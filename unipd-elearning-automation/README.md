@@ -35,7 +35,7 @@ export UNIPD_USER="nome.cognome@studenti.unipd.it"
 export UNIPD_PASSWORD="..."        # Windows PowerShell: $env:UNIPD_PASSWORD="..."
 ```
 
-Dopo il primo accesso la sessione viene salvata in `auth_state.json` (escluso da git): ai lanci
+Dopo il primo accesso la sessione viene salvata in `auth_state.json` (`auth_state_<sito>.json`, escluso da git): ai lanci
 successivi il login viene saltato finché la sessione è valida. Trattalo come una password.
 
 ## Uso
@@ -58,6 +58,23 @@ python unipd_videolezioni.py --course-url "https://medicina.elearning.unipd.it/c
 | `--headless` | browser invisibile (sconsigliato: MFA e play manuale non sono possibili) |
 | `--fresh-login` | ignora la sessione salvata |
 | `-v` | log dettagliato (stato di ogni attività) |
+
+## Altri corsi e conferma presenza
+
+Lo script funziona anche con altri Moodle UniPD: basta passare l'URL del corso, per esempio
+
+```bash
+python unipd_videolezioni.py --course-url "https://elearning.unipd.it/formazione/course/view.php?id=383"
+```
+
+Se durante un video il corso chiede di **confermare la presenza**, lo script non clicca mai da
+solo: mette in pausa il proprio lavoro, avvisa con suono, notifica del Mac e campanello nel
+Terminale (ripetuti ogni minuto) e porta Chrome in primo piano. Quando hai confermato tu,
+riprende. Le finestre di conferma del browser (alert) vengono accettate solo dopo che premi
+Invio nel Terminale.
+
+Si possono avviare due corsi insieme in due finestre del Terminale: ogni sito ha la propria
+sessione salvata (`auth_state_<sito>.json`).
 
 ## Come gestisce attese ed errori
 

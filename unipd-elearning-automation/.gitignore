@@ -1,4 +1,4 @@
-auth_state.json
+auth_state*.json
 screenshots/
 .env
 .venv/
